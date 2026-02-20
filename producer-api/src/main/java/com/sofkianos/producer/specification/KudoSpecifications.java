@@ -39,7 +39,11 @@ public final class KudoSpecifications {
             }
 
             if (criteria.getSearchText() != null && !criteria.getSearchText().isBlank()) {
-                String pattern = "%" + criteria.getSearchText().toLowerCase() + "%";
+                String escaped = criteria.getSearchText()
+                        .replace("\\", "\\\\")
+                        .replace("%", "\\%")
+                        .replace("_", "\\_");
+                String pattern = "%" + escaped.toLowerCase() + "%";
                 predicates.add(cb.or(
                         cb.like(cb.lower(root.get("message")), pattern),
                         cb.like(cb.lower(root.get("toUser")), pattern),
