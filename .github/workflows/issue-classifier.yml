@@ -351,6 +351,195 @@ jobs:
               console.error(`Error fetching CodeQL alerts: ${error.message}`);
             }
 
+      - name: Create Issues from SonarCloud Findings
+        uses: actions/github-script@v7
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_PROJECT_KEY: ElyRiven_sofkianos-mvp
+          SONAR_DEFAULT_BRANCH: develop
+        with:
+          script: |
+            const fs = require('fs');
+            const projectKey = process.env.SONAR_PROJECT_KEY || 'ElyRiven_sofkianos-mvp';
+            const branch = process.env.SONAR_BRANCH || context.payload.pull_request?.head?.ref || process.env.SONAR_DEFAULT_BRANCH || 'develop';
+            const severityFilter = new Set(['BLOCKER', 'CRITICAL', 'MAJOR']);
+            const baseUrl = 'https://sonarcloud.io';
+            
+            if (!process.env.SONAR_TOKEN) {
+              console.log('SONAR_TOKEN is not configured. Skipping SonarCloud issue creation.');
+              return;
+            }
+            
+            const authHeader = `Basic ${Buffer.from(`${process.env.SONAR_TOKEN}:`).toString('base64')}`;
+            const fetchPage = async (pageIndex) => {
+              const searchUrl = `${baseUrl}/api/issues/search?componentKeys=${encodeURIComponent(projectKey)}&types=BUG&statuses=OPEN&ps=100&p=${pageIndex}&branch=${encodeURIComponent(branch)}`;
+              const response = await fetch(searchUrl, { headers: { Authorization: authHeader } });
+              
+              if (!response.ok) {
+                const message = await response.text();
+                throw new Error(`SonarCloud API request failed (${response.status}): ${message}`);
+              }
+              
+              return response.json();
+            };
+            
+            let page = 1;
+            const sonarIssues = [];
+            
+            while (true) {
+              const data = await fetchPage(page);
+              sonarIssues.push(...(data.issues || []));
+              
+              const pageSize = data.paging?.pageSize ?? 0;
+              const total = data.paging?.total ?? 0;
+              
+              if (pageSize === 0 || page * pageSize >= total) {
+                break;
+              }
+              
+              page += 1;
+            }
+            
+            const filteredIssues = sonarIssues.filter(issue => severityFilter.has(issue.severity));
+            
+            if (!filteredIssues.length) {
+              console.log('No SonarCloud issues to process.');
+              return;
+            }
+            
+            const existingIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'sonarcloud,automated-scan',
+              state: 'open',
+              per_page: 100
+            });
+            
+            const existingKeys = new Set();
+            for (const issue of existingIssues) {
+              const match = issue.body?.match(/SonarCloud Issue Key:\s*([A-Z0-9_-]+)/i);
+              if (match?.[1]) {
+                existingKeys.add(match[1]);
+              }
+            }
+            
+            const templatePath = '.github/ISSUE_TEMPLATE/sonarcloud-auto-bug.md';
+            const defaultTemplate = `
+# 🐛 SonarCloud Automated Bug
+
+## 🐛 Description
+{{DESCRIPTION}}
+
+## 🔍 Location
+- **Sonar Issue Key**: {{ISSUE_KEY}}
+- **Rule**: {{RULE}}
+- **Severity**: {{SEVERITY}}
+- **File**: {{FILE_PATH}}
+- **Line**: {{LINE}}
+- **Branch**: {{BRANCH}}
+- **Link**: {{SONAR_LINK}}
+
+## ✅ Expected Behaviour
+Code complies with the referenced SonarCloud rule and passes the quality gate.
+
+## ❌ Detected Behaviour
+{{MESSAGE}}
+
+## 🧪 Validation
+- Detected by: SonarCloud analysis
+- Project: {{PROJECT_KEY}}
+- Scope: Static analysis
+
+## 💡 Proposed Fix
+Review the rule guidance and refactor the code to satisfy the quality gate.
+`.trim();
+            
+            let template = fs.existsSync(templatePath)
+              ? fs.readFileSync(templatePath, 'utf8')
+              : defaultTemplate;
+            
+            template = template.replace(/^---[\s\S]*?---\s*/, '').trim();
+            
+            const severityMap = {
+              BLOCKER: '🔴 Blocker',
+              CRITICAL: '🟠 Critical',
+              MAJOR: '🟡 Major',
+              MINOR: '🟢 Minor',
+              INFO: 'ℹ️ Info'
+            };
+            
+            const fillTemplate = (tpl, data) => tpl
+              .replaceAll('{{DESCRIPTION}}', data.description)
+              .replaceAll('{{ISSUE_KEY}}', data.key)
+              .replaceAll('{{RULE}}', data.rule)
+              .replaceAll('{{SEVERITY}}', data.severity)
+              .replaceAll('{{FILE_PATH}}', data.filePath)
+              .replaceAll('{{LINE}}', data.line)
+              .replaceAll('{{BRANCH}}', data.branch)
+              .replaceAll('{{SONAR_LINK}}', data.link)
+              .replaceAll('{{MESSAGE}}', data.message)
+              .replaceAll('{{PROJECT_KEY}}', data.projectKey);
+            
+            const issuesToCreate = [];
+            for (const sonarIssue of filteredIssues) {
+              if (existingKeys.has(sonarIssue.key)) {
+                continue;
+              }
+              
+              const filePath = sonarIssue.component?.split(':').pop() || 'N/A';
+              const line = sonarIssue.textRange?.startLine
+                ? `${sonarIssue.textRange.startLine}`
+                : 'N/A';
+              const severityLabel = severityMap[sonarIssue.severity] || sonarIssue.severity;
+              const ruleName = sonarIssue.rule || 'Unspecified rule';
+              const issueTitle = `[Bug]: SonarCloud ${ruleName} in ${filePath}`;
+              const issueLink = `${baseUrl}/project/issues?id=${encodeURIComponent(projectKey)}&issues=${sonarIssue.key}&open=${sonarIssue.key}&branch=${encodeURIComponent(branch)}`;
+              
+              const issueBody = fillTemplate(template, {
+                description: sonarIssue.message || 'SonarCloud detected a code quality issue.',
+                key: sonarIssue.key,
+                rule: sonarIssue.rule || 'N/A',
+                severity: severityLabel,
+                filePath,
+                line,
+                branch,
+                link: issueLink,
+                message: sonarIssue.message || 'Refer to SonarCloud for additional context.',
+                projectKey
+              });
+              
+              issuesToCreate.push({
+                title: issueTitle,
+                body: issueBody,
+                labels: ['bug', 'automated-scan', 'sonarcloud']
+              });
+            }
+            
+            if (!issuesToCreate.length) {
+              console.log('All SonarCloud issues already have matching GitHub issues.');
+              return;
+            }
+            
+            const limit = 10;
+            for (const issue of issuesToCreate.slice(0, limit)) {
+              try {
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: issue.title,
+                  body: issue.body,
+                  labels: issue.labels
+                });
+                console.log(`Created issue for ${issue.title}`);
+              } catch (error) {
+                console.error(`Failed to create SonarCloud issue: ${error.message}`);
+              }
+            }
+            
+            if (issuesToCreate.length > limit) {
+              console.log(`Skipped creating ${issuesToCreate.length - limit} additional issues to avoid spam.`);
+            }
+
       - name: Summary Comment on PR
         uses: actions/github-script@v7
         with:
@@ -364,6 +553,7 @@ jobs:
               '- ✅ **ESLint Analysis**: Frontend code quality checked',
               '- ✅ **CodeQL Analysis**: Security and code quality scanned',
               '- ✅ **SpotBugs**: Backend code analysis (if applicable)',
+              '- ✅ **SonarCloud**: Static analysis findings converted into tracked issues',
               '',
               `Check the [Issues](${issuesUrl}) tab for automated findings.`,
               '',
