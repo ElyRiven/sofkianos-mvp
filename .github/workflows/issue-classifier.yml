@@ -45,9 +45,36 @@ jobs:
 
   # Job 2: Automated bug scanning on PR approval
   scan-and-create-issues:
-    name: Scan Project & Create Issues
+    name: SonarCloud Scan & Issue Creation
     if: github.event_name == 'pull_request_review' && github.event.review.state == 'approved'
     runs-on: ubuntu-latest
+    env:
+      SONAR_HOST_URL: https://sonarcloud.io
+      SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
+    strategy:
+      matrix:
+        include:
+          - app: frontend
+            label: frontend
+            baseDir: frontend
+            projectKey: ${{ vars.SONAR_FRONTEND_PROJECT_KEY != '' && vars.SONAR_FRONTEND_PROJECT_KEY || 'sofkianos-frontend' }}
+            sources: src
+            needsNode: true
+            build: ""
+          - app: producer-api
+            label: producer-api
+            baseDir: producer-api
+            projectKey: ${{ vars.SONAR_PRODUCER_PROJECT_KEY != '' && vars.SONAR_PRODUCER_PROJECT_KEY || 'sofkianos-producer-api' }}
+            sources: src/main/java
+            needsNode: false
+            build: "./mvnw -B -DskipTests compile"
+          - app: consumer-worker
+            label: consumer-worker
+            baseDir: consumer-worker
+            projectKey: ${{ vars.SONAR_CONSUMER_PROJECT_KEY != '' && vars.SONAR_CONSUMER_PROJECT_KEY || 'sofkianos-consumer-worker' }}
+            sources: src/main/java
+            needsNode: false
+            build: "./mvnw -B -DskipTests compile"
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -59,317 +86,201 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: 'maven'
 
       - name: Set up Node.js
+        if: matrix.needsNode == true
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
-
-      # ========================================================================
-      # BACKEND ANALYSIS (SpotBugs + PMD)
-      # ========================================================================
-      - name: Run SpotBugs on Producer API
-        working-directory: ./producer-api
-        continue-on-error: true
+      - name: Validate SonarCloud configuration
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
-          ./mvnw compile spotbugs:spotbugs -Dspotbugs.failOnError=false
-          
-      - name: Run SpotBugs on Consumer Worker
-        working-directory: ./consumer-worker
-        continue-on-error: true
+          if [ -z "${SONAR_TOKEN}" ]; then
+            echo "SONAR_TOKEN secret is required to run SonarCloud analysis."
+            exit 1
+          fi
+
+          if [ -z "${SONAR_ORGANIZATION}" ]; then
+            echo "Set repository variable SONAR_ORGANIZATION with your SonarCloud organization key."
+            exit 1
+          fi
+
+          if [ -z "${{ matrix.projectKey }}" ]; then
+            echo "Project key for ${{ matrix.app }} is missing. Configure SONAR_<APP>_PROJECT_KEY repository variable."
+            exit 1
+          fi
+
+      - name: Install frontend dependencies
+        if: matrix.needsNode == true
+        working-directory: ${{ matrix.baseDir }}
         run: |
-          ./mvnw compile spotbugs:spotbugs -Dspotbugs.failOnError=false
+          npm install --no-audit --no-fund --no-package-lock
 
-      # ========================================================================
-      # FRONTEND ANALYSIS (ESLint)
-      # ========================================================================
-      - name: Install Frontend Dependencies
-        working-directory: ./frontend
-        run: npm ci
+      - name: Build Java project
+        if: matrix.build != ''
+        working-directory: ${{ matrix.baseDir }}
+        run: ${{ matrix.build }}
 
-      - name: Run ESLint
-        working-directory: ./frontend
-        continue-on-error: true
-        run: |
-          npm run lint -- --format json --output-file eslint-report.json
-          
-      - name: Upload ESLint Report
-        uses: actions/upload-artifact@v4
-        if: always()
+      - name: Run SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@v2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
-          name: eslint-report
-          path: frontend/eslint-report.json
-          retention-days: 1
+          projectBaseDir: ${{ matrix.baseDir }}
+          args: >
+            -Dsonar.host.url=${{ env.SONAR_HOST_URL }}
+            -Dsonar.organization=${{ env.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ matrix.projectKey }}
+            -Dsonar.sources=${{ matrix.sources }}
+            -Dsonar.pullrequest.key=${{ github.event.pull_request.number }}
+            -Dsonar.pullrequest.branch=${{ github.event.pull_request.head.ref }}
+            -Dsonar.pullrequest.base=${{ github.event.pull_request.base.ref }}
+            -Dsonar.scm.revision=${{ github.event.pull_request.head.sha || github.sha }}
 
-      # ========================================================================
-      # SECURITY ANALYSIS (CodeQL)
-      # ========================================================================
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: java-kotlin, javascript-typescript
-          queries: security-and-quality
-
-      - name: Build Backend for CodeQL
-        working-directory: ./producer-api
-        run: ./mvnw clean package -DskipTests
-
-      - name: Build Frontend for CodeQL
-        working-directory: ./frontend
-        run: npm run build
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-        with:
-          category: "full-project-scan"
-          upload: true
-
-      # ========================================================================
-      # PARSE RESULTS & CREATE ISSUES
-      # ========================================================================
-      - name: Parse ESLint Results and Create Issues
+      - name: Create GitHub issues from SonarCloud findings
         uses: actions/github-script@v7
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+          SONAR_PROJECT_KEY: ${{ matrix.projectKey }}
+          APP_LABEL: ${{ matrix.label }}
+          APP_PROJECT: ${{ matrix.projectKey }}
         with:
           script: |
-            const fs = require('fs');
-            const path = './frontend/eslint-report.json';
-            
-            if (!fs.existsSync(path)) {
-              console.log('No ESLint report found, skipping...');
+            const fetchIssuesFromSonar = async () => {
+              const params = new URLSearchParams({
+                projects: process.env.SONAR_PROJECT_KEY,
+                types: 'BUG',
+                severities: 'BLOCKER,CRITICAL,MAJOR',
+                ps: '100'
+              });
+
+              const prNumber = context.payload.pull_request?.number;
+              const branch = context.payload.pull_request?.head?.ref || process.env.GITHUB_REF_NAME;
+
+              if (prNumber) {
+                params.append('pullRequest', `${prNumber}`);
+              } else if (branch) {
+                params.append('branch', branch);
+              }
+
+              const response = await fetch(`${process.env.SONAR_HOST_URL}/api/issues/search?${params.toString()}`, {
+                headers: {
+                  Authorization: `Basic ${Buffer.from(`${process.env.SONAR_TOKEN}:`).toString('base64')}`
+                }
+              });
+
+              if (!response.ok) {
+                throw new Error(`SonarQube search failed: ${response.status} ${await response.text()}`);
+              }
+
+              const payload = await response.json();
+              return payload.issues || [];
+            };
+
+            const sonarIssues = await fetchIssuesFromSonar();
+
+            if (sonarIssues.length === 0) {
+              console.log('No SonarQube issues found for this analysis.');
               return;
             }
-            
-            const results = JSON.parse(fs.readFileSync(path, 'utf8'));
-            const issues = [];
-            
-            for (const file of results) {
-              if (file.errorCount === 0 && file.warningCount === 0) continue;
-              
-              for (const message of file.messages) {
-                // Only create issues for errors, not warnings
-                if (message.severity !== 2) continue;
-                
-                const issueKey = `${file.filePath}:${message.line}:${message.ruleId}`;
-                
-                // Check if similar issue already exists
-                const existing = issues.find(i => i.key === issueKey);
-                if (existing) continue;
-                
-                const severity = message.severity === 2 ? '🟠 Major' : '🟡 Minor';
-                const fileName = require('path').basename(file.filePath);
-                const issueTitle = `[Bug]: ESLint - ${message.ruleId} in ${fileName}`;
-                const issueBody = [
-                  '## 🐛 Bug Report',
-                  '',
-                  '**📋 Description**',
-                  'ESLint detected a code quality issue in the frontend codebase.',
-                  '',
-                  '**🔁 Steps to Reproduce**',
-                  `1. Open file: ${file.filePath}`,
-                  `2. Go to line ${message.line}, column ${message.column}`,
-                  `3. Observe the issue: ${message.message}`,
-                  '',
-                  '**✅ Expected Results**',
-                  'The code should follow ESLint rules and best practices.',
-                  '',
-                  '**❌ Actual Results**',
-                  `ESLint rule "${message.ruleId}" is violated.`,
-                  '',
-                  '**🚨 Severity Level**',
-                  `${severity} — Code quality issue`,
-                  '',
-                  '**🔍 Validation**',
-                  '- **Confirmed by**: ESLint automated scan',
-                  '- **Environment**: Source code',
-                  `- **Rule**: ${message.ruleId}`,
-                  `- **File**: ${file.filePath}`,
-                  `- **Line**: ${message.line}:${message.column}`,
-                  '',
-                  '**📁 Affected Files / Components**',
-                  `${file.filePath}`,
-                  '',
-                  '**💡 Proposed Solution**',
-                  message.fix ? 'Auto-fix available via ESLint' : 'Manual fix required',
-                  message.ruleId ? `See: https://eslint.org/docs/rules/${message.ruleId}` : ''
-                ].filter(line => line !== undefined).join('\n');
 
-                issues.push({
-                  key: issueKey,
-                  title: issueTitle,
-                  body: issueBody,
-                  labels: ['bug', 'automated-scan', 'frontend']
-                });
-              }
-            }
-            
-            console.log(`Found ${issues.length} ESLint issues to create`);
-            
-            // Create issues (limit to 10 to avoid spam)
-            for (const issue of issues.slice(0, 10)) {
-              try {
-                await github.rest.issues.create({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  title: issue.title,
-                  body: issue.body,
-                  labels: issue.labels
-                });
-                console.log(`Created issue: ${issue.title}`);
-              } catch (error) {
-                console.error(`Failed to create issue: ${error.message}`);
-              }
-            }
-            
-            if (issues.length > 10) {
-              console.log(`Note: ${issues.length - 10} additional issues were found but not created to avoid spam.`);
-            }
+            const existingIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: `automated-scan,sonarcloud,${process.env.APP_LABEL}`,
+              per_page: 100
+            });
 
-      - name: Process CodeQL Results and Create Issues
-        uses: actions/github-script@v7
-        with:
-          script: |
-            // Fetch CodeQL alerts for this repository
-            try {
-              const alerts = await github.rest.codeScanning.listAlertsForRepo({
+            const created = [];
+            const commitSha = context.payload.pull_request?.head?.sha || context.sha;
+            const workflowUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const maxIssues = 20;
+
+            for (const issue of sonarIssues) {
+              if (created.length >= maxIssues) {
+                console.log('Reached issue creation limit, skipping remaining findings.');
+                break;
+              }
+
+              const sonarKey = issue.key;
+              const duplicate = existingIssues.some(existing => (existing.body || '').includes(`sonar-issue-key:${sonarKey}`));
+
+              if (duplicate) {
+                console.log(`Issue for Sonar key ${sonarKey} already exists, skipping.`);
+                continue;
+              }
+
+              const component = issue.component?.includes(':') ? issue.component.split(':')[1] : (issue.component || 'Unknown file');
+              const line = issue.line || issue.textRange?.startLine || 'N/A';
+              const rule = issue.rule || 'N/A';
+              const severity = issue.severity || 'MAJOR';
+              const description = issue.message || 'See SonarQube for details.';
+              const sonarLink = `${process.env.SONAR_HOST_URL}/project/issues?id=${encodeURIComponent(process.env.SONAR_PROJECT_KEY)}&issues=${encodeURIComponent(sonarKey)}`;
+              const title = `🐛 SonarQube: ${rule} in ${component}`;
+
+              const body = [
+                '## 🐛 Bug Detected by SonarQube',
+                '',
+                `**Severity:** \`${severity}\`  `,
+                '**Type:** `BUG`  ',
+                `**Rule:** \`${rule}\``,
+                '',
+                '### 📍 Location',
+                `- **File:** \`${component}\``,
+                `- **Line:** ${line}`,
+                `- **Project:** ${process.env.APP_PROJECT}`,
+                '',
+                '### 📝 Description',
+                description,
+                '',
+                '### 🔗 Links',
+                `- <a href="${sonarLink}">View in SonarQube</a>`,
+                '',
+                '---',
+                '',
+                `**Auto-generated from SonarQube analysis on commit:** \`${commitSha}\`  `,
+                `**Workflow run:** ${workflowUrl}`,
+                '',
+                `<!-- sonar-issue-key:${sonarKey} -->`
+              ].join('\n');
+
+              await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                state: 'open',
-                per_page: 100
+                title,
+                body,
+                labels: ['bug', 'automated-scan', 'sonarcloud', process.env.APP_LABEL]
               });
-              
-              console.log(`Found ${alerts.data.length} open CodeQL alerts`);
-              
-              // Group alerts by severity
-              const criticalAlerts = alerts.data.filter(a => a.rule.security_severity_level === 'critical' || a.rule.severity === 'error');
-              const majorAlerts = alerts.data.filter(a => a.rule.security_severity_level === 'high' || a.rule.severity === 'warning');
-              
-              // Create issues for critical security findings (limit to 5)
-              for (const alert of criticalAlerts.slice(0, 5)) {
-                const isSecurityIssue = alert.rule.security_severity_level != null;
-                const issueTitle = isSecurityIssue 
-                  ? `[Security]: ${alert.rule.description}`
-                  : `[Bug]: ${alert.rule.description}`;
-                
-                const severityMap = {
-                  'critical': '🔴 Critical',
-                  'high': '🟠 Major',
-                  'medium': '🟡 Minor',
-                  'low': '🟢 Enhancement'
-                };
-                
-                const severity = severityMap[alert.rule.security_severity_level] || '🟠 Major';
-                
-                const securityBody = [
-                  '## 🔴 Security Issue',
-                  '',
-                  '**📋 Description**',
-                  `CodeQL detected a security vulnerability: ${alert.rule.description}`,
-                  '',
-                  '**🔁 Steps to Reproduce / Verify**',
-                  `1. Open file: ${alert.most_recent_instance.location.path}`,
-                  `2. Review line ${alert.most_recent_instance.location.start_line}`,
-                  `3. Examine the code for: ${alert.rule.name}`,
-                  '',
-                  '**✅ Expected (Secure) Behaviour**',
-                  alert.rule.help || 'Code should follow security best practices',
-                  '',
-                  '**❌ Actual (Vulnerable) Behaviour**',
-                  alert.most_recent_instance.message.text,
-                  '',
-                  '**🚨 Severity Level**',
-                  `${severity} — Security vulnerability detected`,
-                  '',
-                  '**🔍 Validation**',
-                  '- **Confirmed by**: CodeQL automated security scan',
-                  '- **Environment**: Source code',
-                  `- **Alert Number**: #${alert.number}`,
-                  `- **File**: ${alert.most_recent_instance.location.path}`,
-                  `- **Line**: ${alert.most_recent_instance.location.start_line}`,
-                  '',
-                  '**📁 Affected Files / Components**',
-                  alert.most_recent_instance.location.path,
-                  '',
-                  '**💡 Proposed Long-Term Solution**',
-                  alert.rule.help_uri ? `See CodeQL documentation: ${alert.rule.help_uri}` : 'Review and apply security best practices'
-                ].join('\n');
-                
-                const bugBody = [
-                  '## 🐛 Bug Report',
-                  '',
-                  '**📋 Description**',
-                  `CodeQL detected a code quality issue: ${alert.rule.description}`,
-                  '',
-                  '**🔁 Steps to Reproduce**',
-                  `1. Open file: ${alert.most_recent_instance.location.path}`,
-                  `2. Go to line ${alert.most_recent_instance.location.start_line}`,
-                  `3. Review: ${alert.most_recent_instance.message.text}`,
-                  '',
-                  '**✅ Expected Results**',
-                  alert.rule.help || 'Code should follow best practices',
-                  '',
-                  '**❌ Actual Results**',
-                  alert.most_recent_instance.message.text,
-                  '',
-                  '**🚨 Severity Level**',
-                  severity,
-                  '',
-                  '**🔍 Validation**',
-                  '- **Confirmed by**: CodeQL scan',
-                  `- **File**: ${alert.most_recent_instance.location.path}`,
-                  `- **Line**: ${alert.most_recent_instance.location.start_line}`,
-                  '',
-                  '**📁 Affected Files / Components**',
-                  alert.most_recent_instance.location.path
-                ].join('\n');
-                
-                const issueBody = isSecurityIssue ? securityBody : bugBody;
 
-                try {
-                  const labels = isSecurityIssue 
-                    ? ['security', 'critical', 'automated-scan']
-                    : ['bug', 'automated-scan'];
-                    
-                  await github.rest.issues.create({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    title: issueTitle,
-                    body: issueBody,
-                    labels: labels
-                  });
-                  console.log(`Created issue: ${issueTitle}`);
-                } catch (error) {
-                  console.error(`Failed to create issue: ${error.message}`);
-                }
-              }
-              
-              console.log(`Processed ${Math.min(criticalAlerts.length, 5)} critical alerts`);
-              
-            } catch (error) {
-              console.error(`Error fetching CodeQL alerts: ${error.message}`);
+              console.log(`Created issue for ${component} (rule ${rule})`);
+              created.push(sonarKey);
             }
 
+            console.log(`Created ${created.length} GitHub issue(s) from SonarQube findings.`);
+
       - name: Summary Comment on PR
+        if: matrix.app == 'frontend'
         uses: actions/github-script@v7
         with:
           script: |
-            const issuesUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/issues?q=is%3Aissue+is%3Aopen+label%3Aautomated-scan`;
+            const issuesUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/issues?q=is%3Aissue+is%3Aopen+label%3Asonarcloud`;
             const comment = [
-              '## 🔍 Automated Bug Scan Completed',
+              '## 🔍 Automated SonarCloud Scan Completed',
               '',
-              'The automated bug scanning workflow has completed. Issues have been created for detected problems:',
+              'SonarCloud analysis ran on all applications in this repository:',
               '',
-              '- ✅ **ESLint Analysis**: Frontend code quality checked',
-              '- ✅ **CodeQL Analysis**: Security and code quality scanned',
-              '- ✅ **SpotBugs**: Backend code analysis (if applicable)',
+              '- ✅ **frontend**',
+              '- ✅ **producer-api**',
+              '- ✅ **consumer-worker**',
               '',
-              `Check the [Issues](${issuesUrl}) tab for automated findings.`,
+              `New issues (label: \`sonarcloud\`) were created for detected bugs. Review them here: [Issues](${issuesUrl}).`,
               '',
-              '**Note**: Only the most critical issues are auto-created to avoid spam. Review the Actions artifacts for full reports.'
+              '**Note**: Issue creation is limited to the most important findings to avoid noise.'
             ].join('\n');
-            
+
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
