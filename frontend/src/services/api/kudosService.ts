@@ -1,5 +1,6 @@
 import { apiClient } from "./client";
 import type { KudoFormData } from "../../schemas/kudoFormSchema";
+import type { KudoListParams, PagedKudoResponse } from "../../types/models/kudoPublic";
 
 /**
  * Servicio que encapsula todas las operaciones relacionadas con Kudos.
@@ -9,6 +10,7 @@ import type { KudoFormData } from "../../schemas/kudoFormSchema";
  *
  * Métodos disponibles:
  * - **send**: Envía un kudo al backend (POST /v1/kudos)
+ * - **list**: Obtiene la lista paginada de kudos públicos (GET /v1/kudos)
  *
  * Características:
  * - Validación de status code esperado (202 Accepted)
@@ -62,6 +64,31 @@ export const kudosService = {
     if (response.status !== 202) {
       throw new Error(`Unexpected status: ${response.status}`);
     }
+  },
+
+  /**
+   * Obtiene la lista paginada de kudos públicos desde el API.
+   *
+   * @async
+   * @function list
+   * @memberof kudosService
+   * @param {KudoListParams} [params] - Parámetros de paginación y filtrado.
+   * @param {number} [params.page=0] - Página actual (base 0).
+   * @param {number} [params.size=20] - Tamaño de página (máximo 50).
+   * @param {string} [params.sortDirection='DESC'] - Dirección de ordenamiento.
+   * @param {string} [params.category] - Filtrar por categoría.
+   * @param {string} [params.searchText] - Texto de búsqueda libre.
+   * @returns {Promise<PagedKudoResponse>} Promesa con la lista paginada de kudos.
+   *
+   * @example
+   * const { content, totalElements } = await kudosService.list({ page: 0, size: 20 });
+   */
+  list: async (params: KudoListParams = {}): Promise<PagedKudoResponse> => {
+    const { page = 0, size = 20, sortDirection = 'DESC', ...rest } = params;
+    const response = await apiClient.get("/v1/kudos", {
+      params: { page, size, sortDirection, ...rest },
+    });
+    return response.data as PagedKudoResponse;
   },
 };
 
