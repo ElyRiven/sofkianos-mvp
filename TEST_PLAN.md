@@ -1,13 +1,28 @@
-# TEST PLAN - Estrategia de Calidad SofkianOS MVP
+# Estrategia de Calidad: Diseño de Pruebas
 
-## 1. Análisis de los 7 Principios de Prueba (ISTQB)
+## 1. Teoría Aplicada: Principio Fundamental
 
-Basado en el contexto actual del proyecto (Arquitectura Hexagonal + EDA), se ha determinado el siguiente enfoque prioritario:
+Tras auditar el sistema distribuido (RabbitMQ + Arquitectura Hexagonal), se ha determinado el principio rector para el diseño de pruebas.
 
-*   **Principio Crítico:** **- Pruebas Tempranas (Early Testing)**.
-*   **Justificación:** En un sistema distribuido donde los fallos de contrato (serialización) y las reglas de dominio son críticos, mover la validación lo más cerca posible de la creación del dato (TDD en el Producer API) minimiza el costo de corrección y evita la propagación de "Kudos Fantasmas" hacia el Worker y la Base de Datos.
+### Principio Seleccionado: Las pruebas dependen del contexto
 
-### Definir nivel de prueba
+### Justificación
 
-A nivel Unitario, nos enfocaremos en la Lógica de Dominio Pura. Probaremos que el objeto Kudo se autovalida (reglas de negocio) y que el KudoService coordina correctamente las llamadas, pero usaremos Mocks para los Puertos de Salida (RabbitMQ/DB).
+En un entorno asíncrono y desacoplado, la calidad no se limita a la lógica funcional, sino a la **integridad de los datos** a lo largo de su ciclo de vida.
 
+El incidente del **“Kudo Fantasma”** (fallo de serialización) demuestra que el riesgo real reside en los *bordes del sistema* y en cómo los datos sobreviven al transporte entre microservicios.
+
+---
+
+## Definición de Niveles de Prueba
+
+### Diseño del Nivel Unitario
+
+El enfoque principal estará en el componente **`Kudo.Builder`** dentro del *Core Domain*.
+
+Este componente actúa como el **“portero” del sistema**:
+- Si una regla de negocio falla aquí, el proceso se detiene inmediatamente
+- Se evita que datos inválidos contaminen la infraestructura
+- Se protege la consistencia del dominio, independientemente del origen del mensaje
+
+Al validar primero este nivel, garantizamos que el sistema falle **rápido, barato y de forma explícita**, alineado con los principios de TDD y Arquitectura Hexagonal.
