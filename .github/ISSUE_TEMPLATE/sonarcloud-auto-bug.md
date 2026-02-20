@@ -6,7 +6,7 @@ Use this template to describe SonarCloud findings promoted to GitHub issues.
 {{DESCRIPTION}}
 
 ## 🔍 Location
-- **Sonar Issue Key**: {{ISSUE_KEY}}
+- **SonarCloud Issue Key**: {{ISSUE_KEY}}
 - **Rule**: {{RULE}}
 - **Severity**: {{SEVERITY}}
 - **File**: {{FILE_PATH}}

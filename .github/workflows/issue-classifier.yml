@@ -361,7 +361,11 @@ jobs:
           script: |
             const fs = require('fs');
             const projectKey = process.env.SONAR_PROJECT_KEY || 'ElyRiven_sofkianos-mvp';
-            const branch = process.env.SONAR_BRANCH || context.payload.pull_request?.head?.ref || process.env.SONAR_DEFAULT_BRANCH || 'develop';
+            const branch = process.env.SONAR_BRANCH || context.payload.pull_request?.head?.ref || process.env.SONAR_DEFAULT_BRANCH;
+            
+            if (!branch) {
+              throw new Error('SonarCloud branch is not configured (set SONAR_BRANCH or SONAR_DEFAULT_BRANCH).');
+            }
             const severityFilter = new Set(['BLOCKER', 'CRITICAL', 'MAJOR']);
             const baseUrl = 'https://sonarcloud.io';
             
@@ -417,7 +421,7 @@ jobs:
             
             const existingKeys = new Set();
             for (const issue of existingIssues) {
-              const match = issue.body?.match(/SonarCloud Issue Key:\s*([A-Z0-9_-]+)/i);
+              const match = issue.body?.match(/SonarCloud Issue Key:\s*([A-Za-z0-9_:.-]+)/i);
               if (match?.[1]) {
                 existingKeys.add(match[1]);
               }
@@ -431,7 +435,7 @@ jobs:
 {{DESCRIPTION}}
 
 ## 🔍 Location
-- **Sonar Issue Key**: {{ISSUE_KEY}}
+- **SonarCloud Issue Key**: {{ISSUE_KEY}}
 - **Rule**: {{RULE}}
 - **Severity**: {{SEVERITY}}
 - **File**: {{FILE_PATH}}
@@ -458,6 +462,7 @@ Review the rule guidance and refactor the code to satisfy the quality gate.
               ? fs.readFileSync(templatePath, 'utf8')
               : defaultTemplate;
             
+            // strip optional YAML frontmatter commonly present in GitHub issue templates
             template = template.replace(/^---[\s\S]*?---\s*/, '').trim();
             
             const severityMap = {
@@ -468,17 +473,34 @@ Review the rule guidance and refactor the code to satisfy the quality gate.
               INFO: 'ℹ️ Info'
             };
             
-            const fillTemplate = (tpl, data) => tpl
-              .replaceAll('{{DESCRIPTION}}', data.description)
-              .replaceAll('{{ISSUE_KEY}}', data.key)
-              .replaceAll('{{RULE}}', data.rule)
-              .replaceAll('{{SEVERITY}}', data.severity)
-              .replaceAll('{{FILE_PATH}}', data.filePath)
-              .replaceAll('{{LINE}}', data.line)
-              .replaceAll('{{BRANCH}}', data.branch)
-              .replaceAll('{{SONAR_LINK}}', data.link)
-              .replaceAll('{{MESSAGE}}', data.message)
-              .replaceAll('{{PROJECT_KEY}}', data.projectKey);
+            const escapeMarkdown = (value) => String(value ?? '').replace(/[\\`*_{}\[\]()#+.!|<>]/g, '\\$&');
+            const shorten = (value, max = 80) => value.length > max ? `${value.slice(0, max - 3)}...` : value;
+            const shortenPath = (value, max = 80) => value.length > max ? `...${value.slice(-max + 3)}` : value;
+            
+            const fillTemplate = (tpl, data) => {
+              const passthroughKeys = new Set(['link']); // keep URLs untouched to preserve clickable links
+              const placeholderMap = {
+                '{{DESCRIPTION}}': 'description',
+                '{{ISSUE_KEY}}': 'key',
+                '{{RULE}}': 'rule',
+                '{{SEVERITY}}': 'severity',
+                '{{FILE_PATH}}': 'filePath',
+                '{{LINE}}': 'line',
+                '{{BRANCH}}': 'branch',
+                '{{SONAR_LINK}}': 'link',
+                '{{MESSAGE}}': 'message',
+                '{{PROJECT_KEY}}': 'projectKey'
+              };
+              
+              let content = tpl;
+              for (const [placeholder, key] of Object.entries(placeholderMap)) {
+                const rawValue = data[key] ?? '';
+                const safeValue = passthroughKeys.has(key) ? String(rawValue) : escapeMarkdown(rawValue);
+                content = content.replaceAll(placeholder, safeValue);
+              }
+              
+              return content;
+            };
             
             const issuesToCreate = [];
             for (const sonarIssue of filteredIssues) {
@@ -486,13 +508,20 @@ Review the rule guidance and refactor the code to satisfy the quality gate.
                 continue;
               }
               
-              const filePath = sonarIssue.component?.split(':').pop() || 'N/A';
+              const componentRef = sonarIssue.component || '';
+              const filePath = componentRef.includes(':')
+                ? componentRef.split(':').slice(1).join(':') || componentRef
+                : componentRef || 'N/A';
               const line = sonarIssue.textRange?.startLine
                 ? `${sonarIssue.textRange.startLine}`
                 : 'N/A';
               const severityLabel = severityMap[sonarIssue.severity] || sonarIssue.severity;
               const ruleName = sonarIssue.rule || 'Unspecified rule';
-              const issueTitle = `[Bug]: SonarCloud ${ruleName} in ${filePath}`;
+              const shortRule = shorten(ruleName, 40);
+              const shortPath = shortenPath(filePath, 60);
+              const titleRule = escapeMarkdown(shortRule);
+              const titlePath = escapeMarkdown(shortPath);
+              const issueTitle = `[Bug]: SonarCloud ${titleRule} in ${titlePath}`; // GitHub titles render as plain text; truncation keeps them readable
               const issueLink = `${baseUrl}/project/issues?id=${encodeURIComponent(projectKey)}&issues=${sonarIssue.key}&open=${sonarIssue.key}&branch=${encodeURIComponent(branch)}`;
               
               const issueBody = fillTemplate(template, {
